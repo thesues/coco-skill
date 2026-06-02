@@ -2,11 +2,13 @@
 # coco-review.sh — drive the local `coco` CLI as a REVIEW-ONLY code reviewer.
 # Model fallback: GPT-5.5 => GLM-5.1.
 #
-# Three modes (all share: disposable git-worktree isolation + model fallback + auto-cleanup):
-#   1) (default)  /findbugs DIFF review of working changes / MR / commit range
+# Three modes (all share: disposable git-worktree isolation + model fallback + auto-cleanup).
+# NONE of them call coco's built-in /findbugs skill — every mode drives coco with our own
+# prompt embedded in this script:
+#   1) (default)  DIFF review of working changes / MR / commit range (custom prompt)
 #   2) inspect    full-file review of EXISTING code (no diff needed), loops over many files
-#   3) arch       direct-coco ARCHITECTURE / data-corruption audit (not /findbugs),
-#                 cross-component reasoning, optionally fed prior findings via --context
+#   3) arch       ARCHITECTURE / data-corruption audit, cross-component reasoning,
+#                 optionally fed prior findings via --context
 #
 # HARD GUARANTEE: never modifies your code. coco's tools include Bash, which can write files
 #   even when Edit/Write are disallowed — so we run everything inside a throwaway git WORKTREE
@@ -144,25 +146,69 @@ run_coco() {
   return 1
 }
 
-GUARD_FB=$'\n\n[硬约束] 你只做代码评审，绝对禁止修改、创建或删除任何文件，禁止用 Bash 写入仓库文件，禁止进入/执行任何修复阶段（findbugs 阶段 5）。只输出评审结论，不要询问是否修复，不要尝试修复。'
-GUARD_RO=$'\n\n[硬约束] 这是一次只读审计：绝对禁止修改、创建或删除任何文件，禁止用 Bash 写入仓库文件，只输出分析结论。'
+# Read-only hard constraint appended to EVERY prompt (findbugs / inspect / arch).
+GUARD_RO=$'\n\n[硬约束] 这是一次只读评审：绝对禁止修改、创建或删除任何文件，禁止用 Bash 写入仓库文件，禁止进入任何修复阶段，不要询问是否修复，只输出评审/分析结论。'
+
+# Shared review dimensions + output spec (used by findbugs + inspect; NO coco /findbugs skill).
+REVIEW_DIMS=$'审查维度：\n- 正确性：逻辑错误、算法/状态机错误、错误的条件判断、off-by-one。\n- 并发：数据竞争、死锁、锁顺序、未保护的共享状态、原子性缺失。\n- 资源：未释放的句柄/锁/连接/goroutine、泄漏、重复关闭。\n- 错误处理：被吞掉的错误、未检查的返回值、错误的传播、panic/nil 解引用。\n- 边界：空值/越界/整数溢出/空集合/超大输入。\n- 安全：注入、路径穿越、权限校验缺失、敏感信息泄漏、不安全的反序列化。\n- API 误用与回归风险。'
+OUTPUT_SPEC=$'输出要求：按严重度从高到低（P0 最严重 .. P3 最轻）逐条列出，每条包含【严重度 / 文件:行 / 类别 / 问题描述 / 触发或影响场景 / 修复建议】。定位到具体代码，不要泛泛而谈。若确无问题，明确输出“未发现问题”。'
 
 rc=0
 case "$MODE" in
   findbugs)
-    if [ ${#FINDBUGS_ARGS[@]} -gt 0 ]; then p="/findbugs ${FINDBUGS_ARGS[*]}${GUARD_FB}"; else p="/findbugs${GUARD_FB}"; fi
-    run_coco "$p" || rc=1
+    # Custom diff-review prompt (NOT coco's /findbugs skill). Parse native-style args ourselves.
+    DEPTH="deep"; WITH_LINT=1; MR_URL=""; DIFF_TARGET=""
+    if [ ${#FINDBUGS_ARGS[@]} -gt 0 ]; then
+      i=0
+      while [ $i -lt ${#FINDBUGS_ARGS[@]} ]; do
+        a="${FINDBUGS_ARGS[$i]}"
+        case "$a" in
+          fast|deep)                                   DEPTH="$a" ;;
+          --with-lint=false|--with-lint=0|--no-lint)   WITH_LINT=0 ;;
+          --with-lint|--with-lint=true|--with-lint=1)  WITH_LINT=1 ;;
+          --mr)    i=$((i+1)); MR_URL="${FINDBUGS_ARGS[$i]:-}" ;;
+          --mr=*)  MR_URL="${a#--mr=}" ;;
+          *)       DIFF_TARGET="$a" ;;
+        esac
+        i=$((i+1))
+      done
+    fi
+
+    if [ -n "$MR_URL" ]; then
+      # 只读拉取：禁止 git fetch（会写入与真实仓库共享的 .git 对象库，破坏只读保证）。
+      SRC=$'获取改动：请用【只读】方式拉取以下 MR/PR 的 diff 后评审——优先 `gh pr diff <url>`、`glab mr diff`，或 `curl` 拉取其 .diff/.patch URL。\n严禁使用 `git fetch`/`git pull`（本仓库与真实仓库共享 .git 对象库，fetch 会写入真实仓库）。\nMR/PR：'"$MR_URL"
+    elif [ -n "$DIFF_TARGET" ]; then
+      SRC=$'获取改动：在仓库根目录运行 `git diff '"$DIFF_TARGET"$'` 取得本次要评审的 diff。若 diff 为空，请直接说明“无改动可评审”。'
+    else
+      # 默认评工作区改动：先 `git add -A -N`（仅作用于这个一次性隔离 worktree，安全），
+      # 这样新增但未跟踪的文件也会出现在 `git diff HEAD` 里，不被漏审。
+      SRC=$'获取改动：在仓库根目录先运行 `git add -A -N`（让新增未跟踪文件也纳入），再运行 `git diff HEAD` 取得本次要评审的 diff（含已修改文件与新增文件）。若 diff 为空，请直接说明“无改动可评审”。'
+    fi
+    case "$DEPTH" in
+      fast) DNOTE=$'评审力度：fast —— 快速过一遍，只报高置信度、明显的问题。' ;;
+      *)    DNOTE=$'评审力度：deep —— 深入推理，包含跨函数/跨文件的数据流与并发分析。' ;;
+    esac
+    if [ "$WITH_LINT" -eq 1 ]; then LNOTE=$'可附带次要的代码规范/lint 级问题（标注为 P3）。'; else LNOTE=$'忽略纯风格/lint 问题，只报真正的 bug。'; fi
+
+    FINDBUGS_PROMPT=$'你是一名严格的资深代码评审专家。请对【本次代码改动】做 bug 评审。\n\n'"$SRC"$'\n\n只聚焦【变更的行】及其直接影响，不要泛泛评审未改动的旧代码。\n'"$DNOTE"$'\n'"$LNOTE"$'\n\n'"$REVIEW_DIMS"$'\n\n'"$OUTPUT_SPEC"
+    run_coco "${FINDBUGS_PROMPT}${GUARD_RO}" || rc=1
     ;;
 
   inspect)
     [ ${#INSPECT_FILES[@]} -gt 0 ] || { echo "ERROR: 'inspect' needs at least one file path." >&2; exit 2; }
     echo ">>> inspect mode: ${#INSPECT_FILES[@]} file(s), --mode=$INSPECT_MODE" >&2
+    case "$INSPECT_MODE" in
+      fast) IDNOTE=$'评审力度：fast —— 只报高置信度、明显的问题。' ;;
+      *)    IDNOTE=$'评审力度：deep —— 深入逐行推理，含数据流与并发分析。' ;;
+    esac
     for file in "${INSPECT_FILES[@]}"; do
       echo
       echo "==================================================================="
-      echo "### coco /findbugs inspect — $file  (mode=$INSPECT_MODE)"
+      echo "### coco inspect — $file  (mode=$INSPECT_MODE)"
       echo "==================================================================="
-      run_coco "/findbugs inspect --path ${file} --mode ${INSPECT_MODE}${GUARD_FB}" "$file" || rc=1
+      # Custom full-file review prompt (NOT coco's /findbugs skill).
+      INSPECT_PROMPT=$'你是一名严格的资深代码评审专家。请对文件【'"$file"$'】做全量逐行评审（把它当作全新代码全量审，不依赖 diff）。\n\n请先读取该文件完整内容，再逐段审查。\n'"$IDNOTE"$'\n\n'"$REVIEW_DIMS"$'\n\n'"$OUTPUT_SPEC"
+      run_coco "${INSPECT_PROMPT}${GUARD_RO}" "$file" || rc=1
     done
     ;;
 
